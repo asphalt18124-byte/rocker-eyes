@@ -1,0 +1,148 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rocker Eyes</title>
+<style>
+body{margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center}
+#wrap{position:relative;width:100%;max-width:640px;margin:auto}
+video,canvas{width:100%;display:block}
+canvas{position:absolute;left:0;top:0}
+button{font-size:18px;padding:12px 22px;margin:8px;border:0;border-radius:10px}
+#log{padding:10px;min-height:3em;font-size:18px}
+</style>
+</head>
+<body>
+<div id="wrap"><video id="v" playsinline muted></video><canvas id="c"></canvas></div>
+<div id="log">Tap Start</div>
+<button id="start">Start</button>
+<button id="ask" disabled>Ask me</button>
+<button id="all" disabled>Describe all</button>
+<button id="key">API key</button>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const v = document.getElementById('v'), c = document.getElementById('c');
+const ctx = c.getContext('2d'), logEl = document.getElementById('log');
+let model, lastSaid = '', lastTime = 0, current = [], quietUntil = 0;
+
+function say(t) {
+  speechSynthesis.cancel();
+  speechSynthesis.speak(new SpeechSynthesisUtterance(t));
+  logEl.textContent = t;
+}
+
+function where(p) {
+  const x = (p.bbox[0] + p.bbox[2] / 2) / c.width;
+  return x < 0.33 ? 'on your left' : x > 0.66 ? 'on your right' : 'in front of you';
+}
+
+function describe() {
+  if (!current.length) return 'I do not see anything clear.';
+  const n = {};
+  current.forEach(p => n[p.class] = (n[p.class] || 0) + 1);
+  return 'I see ' + Object.entries(n).map(([k, q]) => q + ' ' + k).join(', ');
+}
+
+async function loop() {
+  current = (await model.detect(v)).filter(p => p.score > 0.55);
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.lineWidth = 3; ctx.font = '20px sans-serif';
+  current.forEach(p => {
+    ctx.strokeStyle = ctx.fillStyle = p.class === 'person' ? '#0f0' : '#0af';
+    ctx.strokeRect(...p.bbox);
+    ctx.fillText(p.class + ' ' + Math.round(p.score * 100) + '%', p.bbox[0], p.bbox[1] - 5);
+  });
+  const person = current.find(p => p.class === 'person');
+  if (person) {
+    const s = 'Person ' + where(person);
+    if (Date.now() > quietUntil && (s !== lastSaid || Date.now() - lastTime > 8000)) {
+      say(s); lastSaid = s; lastTime = Date.now();
+    }
+  } else lastSaid = '';
+  requestAnimationFrame(loop);
+}
+
+async function cloud(question) {
+  let key = '';
+  try { key = localStorage.getItem('k') || ''; } catch (e) {}
+  if (!key) return say('Please set your API key first.');
+  logEl.textContent = 'Thinking...';
+  const o = document.createElement('canvas');
+  o.width = 640; o.height = Math.round(640 * v.videoHeight / v.videoWidth);
+  o.getContext('2d').drawImage(v, 0, 0, o.width, o.height);
+  const b64 = o.toDataURL('image/jpeg', 0.7).split(',')[1];
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-5-5',
+        max_tokens: 300,
+        system: 'You are the eyes of a small robot. Reply in 1 to 3 short spoken sentences, no markdown. Say where things are (left, right, ahead) and mention people and hazards first.',
+        messages: [{ role: 'user', content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
+          { type: 'text', text: question }
+        ] }]
+      })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error ? d.error.message : r.status);
+    quietUntil = Date.now() + 12000;
+    say(d.content[0].text);
+  } catch (e) { logEl.textContent = 'Cloud error: ' + e.message; }
+}
+
+document.getElementById('all').onclick = () =>
+  cloud('List everything you can see around, including small objects, text and what people are doing.');
+
+document.getElementById('key').onclick = () => {
+  const k = prompt('Paste your Anthropic API key');
+  if (k) { try { localStorage.setItem('k', k.trim()); } catch (e) {} logEl.textContent = 'Key saved'; }
+};
+
+document.getElementById('start').onclick = async function () {
+  this.disabled = true;
+  logEl.textContent = 'Loading...';
+  try {
+    v.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    await v.play();
+    c.width = v.videoWidth; c.height = v.videoHeight;
+    model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    document.getElementById('ask').disabled = false;
+    document.getElementById('all').disabled = false;
+    say('I am ready');
+    loop();
+  } catch (e) { logEl.textContent = 'Error: ' + e.message; this.disabled = false; }
+};
+
+document.getElementById('ask').onclick = () => {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return say('Voice input is not supported here.');
+  const r = new SR();
+  r.lang = 'en-US';
+  r.onresult = e => {
+    const t = e.results[0][0].transcript.toLowerCase();
+    logEl.textContent = 'You: ' + t;
+    let hasKey = false;
+    try { hasKey = !!localStorage.getItem('k'); } catch (e) {}
+    if (hasKey) cloud(t);
+    else if (t.includes('see') || t.includes('front') || t.includes('what')) say(describe());
+    else if (t.includes('person') || t.includes('anyone')) {
+      const p = current.find(p => p.class === 'person');
+      say(p ? 'Yes, a person ' + where(p) : 'No person right now.');
+    } else say('I heard ' + t);
+  };
+  r.start();
+  logEl.textContent = 'Listening...';
+};
+</script>
+</body>
+</html>
